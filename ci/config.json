@@ -1,1 +1,21 @@
-{"architectures":[],"cuda_image":"","cuda_tag":"","cuda_version":"","cuda_version_short":"","runner":""}
+{
+  "architectures": [
+    "75-virtual",
+    "80-virtual",
+    "86-virtual",
+    "87-virtual",
+    "88-virtual",
+    "89-virtual",
+    "90-virtual",
+    "100-virtual",
+    "103-virtual",
+    "110-virtual",
+    "120-virtual",
+    "121-virtual"
+  ],
+  "cuda_image": "nvidia/cuda:13.1.1-cudnn-devel-ubuntu24.04",
+  "cuda_tag": "13.1.1-cudnn-devel-ubuntu24.04",
+  "cuda_version": "13.1.1",
+  "cuda_version_short": "13.1",
+  "runner": "ubuntu-24.04"
+}
