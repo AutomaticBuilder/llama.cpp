@@ -1,0 +1,165 @@
+name: Update CUDA Config
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: 'GitHub Actions runner label (e.g. ubuntu-24.04, self-hosted)'
+        required: true
+        default: 'ubuntu-24.04'
+        type: string
+      cuda_image:
+        description: 'Full CUDA Docker image (e.g. nvidia/cuda:13.1.1-cudnn-devel-ubuntu24.04)'
+        required: true
+        default: 'nvidia/cuda:13.1.1-cudnn-devel-ubuntu24.04'
+        type: string
+
+jobs:
+  update-config:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Parse CUDA image metadata
+        id: parse
+        run: |
+          set -euo pipefail
+          FULL_IMAGE="${{ inputs.cuda_image }}"
+
+          CUDA_TAG="${FULL_IMAGE##*:}"
+
+          CUDA_VERSION=$(echo "$CUDA_TAG" | grep -oP '^\d+\.\d+\.\d+')
+          if [ -z "$CUDA_VERSION" ]; then
+            echo "::error::Could not parse CUDA version from image tag: $CUDA_TAG"
+            exit 1
+          fi
+
+          CUDA_VERSION_SHORT=$(echo "$CUDA_VERSION" | cut -d. -f1,2)
+
+          echo "Full image:         $FULL_IMAGE"
+          echo "CUDA tag:           $CUDA_TAG"
+          echo "CUDA version:       $CUDA_VERSION"
+          echo "CUDA version short: $CUDA_VERSION_SHORT"
+
+          {
+            echo "full_image=$FULL_IMAGE"
+            echo "cuda_tag=$CUDA_TAG"
+            echo "cuda_version=$CUDA_VERSION"
+            echo "cuda_version_short=$CUDA_VERSION_SHORT"
+          } >> $GITHUB_OUTPUT
+
+      - name: Pull CUDA image and detect supported architectures
+        id: arches
+        run: |
+          set -euo pipefail
+          FULL_IMAGE="${{ steps.parse.outputs.full_image }}"
+
+          echo "Pulling $FULL_IMAGE ..."
+          docker pull "$FULL_IMAGE"
+
+          echo "Querying supported compute capabilities via nvcc --list-gpu-arch ..."
+          ARCH_NUMBERS=$(docker run --rm "$FULL_IMAGE" \
+            bash -c "nvcc --list-gpu-arch" 2>/dev/null \
+            | grep -oP '(?<=compute_)\d+' \
+            | sort -nu)
+
+          if [ -z "$ARCH_NUMBERS" ]; then
+            echo "::error::nvcc --list-gpu-arch returned no output. Is nvcc installed in this image?"
+            exit 1
+          fi
+
+          echo "Detected compute capabilities:"
+          echo "$ARCH_NUMBERS"
+
+          ARCHES_JSON="["
+          FIRST=true
+          while IFS= read -r arch; do
+            [ -z "$arch" ] && continue
+            if [ "$FIRST" = true ]; then
+              FIRST=false
+            else
+              ARCHES_JSON="${ARCHES_JSON},"
+            fi
+            ARCHES_JSON="${ARCHES_JSON}\"${arch}-virtual\""
+          done <<< "$ARCH_NUMBERS"
+          ARCHES_JSON="${ARCHES_JSON}]"
+
+          echo "Architectures JSON: $ARCHES_JSON"
+          echo "architectures_json=$ARCHES_JSON" >> $GITHUB_OUTPUT
+
+          docker rmi "$FULL_IMAGE" || true
+
+      - name: Update RUNNER_TYPE repository variable
+        env:
+          GH_TOKEN: ${{ secrets.CONFIG_PAT }}
+        run: |
+          gh variable set RUNNER_TYPE \
+            --body "${{ inputs.runner }}" \
+            --repo "${{ github.repository }}"
+          echo "RUNNER_TYPE set to: ${{ inputs.runner }}"
+
+      - name: Build updated ci/config.json
+        run: |
+          set -euo pipefail
+
+          echo '${{ steps.arches.outputs.architectures_json }}' > /tmp/arches.json
+
+          jq -n \
+            --arg cuda_image "${{ steps.parse.outputs.full_image }}" \
+            --arg cuda_tag "${{ steps.parse.outputs.cuda_tag }}" \
+            --arg cuda_version "${{ steps.parse.outputs.cuda_version }}" \
+            --arg cuda_version_short "${{ steps.parse.outputs.cuda_version_short }}" \
+            --arg runner "${{ inputs.runner }}" \
+            --argjson architectures "$(cat /tmp/arches.json)" \
+            '{
+              architectures: $architectures,
+              cuda_image: $cuda_image,
+              cuda_tag: $cuda_tag,
+              cuda_version: $cuda_version,
+              cuda_version_short: $cuda_version_short,
+              runner: $runner
+            }' > /tmp/new-config.json
+
+          echo "New config.json:"
+          cat /tmp/new-config.json
+
+      - name: Commit ci/config.json via GitHub Contents API
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          FILE_SHA=$(gh api "repos/${{ github.repository }}/contents/ci/config.json" \
+            --jq '.sha')
+
+          NEW_CONTENT=$(printf '%s\n' "$(cat /tmp/new-config.json)" | base64 -w 0)
+
+          COMMIT_MSG="ci: update CUDA config to ${{ steps.parse.outputs.cuda_version }} on ${{ inputs.runner }}"
+
+          gh api "repos/${{ github.repository }}/contents/ci/config.json" \
+            --method PUT \
+            --field message="$COMMIT_MSG" \
+            --field content="$NEW_CONTENT" \
+            --field sha="$FILE_SHA" \
+            --field branch="${{ github.ref_name }}"
+
+          echo "Committed: $COMMIT_MSG"
+
+      - name: Summary
+        run: |
+          {
+            echo "### Config Updated"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| CUDA image | \`${{ steps.parse.outputs.full_image }}\` |"
+            echo "| CUDA version | \`${{ steps.parse.outputs.cuda_version }}\` |"
+            echo "| Runner | \`${{ inputs.runner }}\` |"
+            echo "| Architectures | \`${{ steps.arches.outputs.architectures_json }}\` |"
+          } >> $GITHUB_STEP_SUMMARY

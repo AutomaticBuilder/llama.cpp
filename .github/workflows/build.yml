@@ -1,0 +1,213 @@
+name: Build llama.cpp with CUDA
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check-release:
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+      release_tag: ${{ steps.check.outputs.release_tag }}
+      release_hash: ${{ steps.check.outputs.release_hash }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Check for new release
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          LATEST_RELEASE=$(curl -sf -H "Authorization: Bearer $GH_TOKEN" \
+            https://api.github.com/repos/ggml-org/llama.cpp/releases/latest | jq -r '.tag_name')
+          RELEASE_HASH=$(curl -sf -H "Authorization: Bearer $GH_TOKEN" \
+            https://api.github.com/repos/ggml-org/llama.cpp/releases/latest | jq -r '.target_commitish')
+
+          echo "Latest llama.cpp release: $LATEST_RELEASE"
+          echo "Release hash: $RELEASE_HASH"
+
+          if git tag | grep -q "^${LATEST_RELEASE}$"; then
+            echo "Release $LATEST_RELEASE already built"
+            echo "should_build=false" >> $GITHUB_OUTPUT
+          else
+            echo "New release detected: $LATEST_RELEASE"
+            echo "should_build=true" >> $GITHUB_OUTPUT
+          fi
+
+          echo "release_tag=$LATEST_RELEASE" >> $GITHUB_OUTPUT
+          echo "release_hash=$RELEASE_HASH" >> $GITHUB_OUTPUT
+
+  setup-matrix:
+    needs: check-release
+    if: needs.check-release.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      architectures: ${{ steps.matrix.outputs.architectures }}
+      cuda_image: ${{ steps.matrix.outputs.cuda_image }}
+      cuda_version: ${{ steps.matrix.outputs.cuda_version }}
+      cuda_version_short: ${{ steps.matrix.outputs.cuda_version_short }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Ensure config exists
+        run: |
+          if [ ! -f ci/config.json ]; then
+            echo "ci/config.json not found" >&2
+            exit 1
+          fi
+
+      - name: Read config.json
+        id: matrix
+        run: |
+          echo "architectures=$(jq -c '.architectures' ci/config.json)" >> $GITHUB_OUTPUT
+          echo "cuda_image=$(jq -r '.cuda_image' ci/config.json)" >> $GITHUB_OUTPUT
+          echo "cuda_version=$(jq -r '.cuda_version' ci/config.json)" >> $GITHUB_OUTPUT
+          echo "cuda_version_short=$(jq -r '.cuda_version_short' ci/config.json)" >> $GITHUB_OUTPUT
+
+  build:
+    needs: [check-release, setup-matrix]
+    runs-on: ${{ vars.RUNNER_TYPE || 'ubuntu-latest' }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: true
+      matrix:
+        arch: ${{ fromJson(needs.setup-matrix.outputs.architectures) }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Maximize build space
+        run: |
+          echo "=== Initial disk space ==="
+          df -h
+
+          sudo apt-get remove -y '^aspnetcore-.*' || true
+          sudo apt-get remove -y '^dotnet-.*' --fix-missing || true
+          sudo apt-get remove -y '^llvm-.*' --fix-missing || true
+          sudo apt-get remove -y 'php.*' --fix-missing || true
+          sudo apt-get remove -y '^mongodb-.*' --fix-missing || true
+          sudo apt-get remove -y '^mysql-.*' --fix-missing || true
+          sudo apt-get remove -y azure-cli google-chrome-stable firefox powershell mono-devel libgl1-mesa-dri --fix-missing || true
+          sudo apt-get autoremove -y || true
+          sudo apt-get clean || true
+
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf /usr/share/swift
+          sudo rm -rf /usr/local/.ghcup
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+
+          docker system prune -af || true
+
+          echo "=== After cleanup ==="
+          df -h
+
+      - name: Build helper Docker image
+        run: |
+          docker build \
+            --build-arg BASE_IMAGE="${{ needs.setup-matrix.outputs.cuda_image }}" \
+            -t cuda-builder:${{ needs.setup-matrix.outputs.cuda_version_short }} \
+            .
+
+      - name: Clone llama.cpp
+        run: |
+          git clone --depth 1 --branch "${{ needs.check-release.outputs.release_tag }}" \
+            https://github.com/ggml-org/llama.cpp.git \
+          || (git clone https://github.com/ggml-org/llama.cpp.git \
+              && cd llama.cpp \
+              && git checkout "${{ needs.check-release.outputs.release_hash }}")
+          ls -lah llama.cpp
+
+      - name: Build arch ${{ matrix.arch }}
+        env:
+          CUDA_VERSION_SHORT: ${{ needs.setup-matrix.outputs.cuda_version_short }}
+          CUDA_VERSION: ${{ needs.setup-matrix.outputs.cuda_version }}
+          RELEASE_TAG: ${{ needs.check-release.outputs.release_tag }}
+          RELEASE_HASH: ${{ needs.check-release.outputs.release_hash }}
+        run: |
+          set -euo pipefail
+          mkdir -p binaries
+
+          docker run --rm \
+            -v "$PWD":/workspace \
+            cuda-builder:${{ needs.setup-matrix.outputs.cuda_version_short }} \
+            bash /workspace/scripts/build-arch.sh \
+              "${{ matrix.arch }}" \
+              "$CUDA_VERSION_SHORT" \
+              "$CUDA_VERSION" \
+              "$RELEASE_TAG" \
+              "$RELEASE_HASH"
+
+          sudo chown -R "$(id -u):$(id -g)" "$PWD"
+
+          echo "=== Final disk usage ==="
+          df -h
+          echo "=== Build output ==="
+          ls -Rlh binaries
+
+      - name: Package artifact
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          CUDA_SHORT="${{ needs.setup-matrix.outputs.cuda_version_short }}"
+          ARCH="${{ matrix.arch }}"
+
+          tar -C "binaries/cuda-${CUDA_SHORT}" \
+            -czf "release-assets/llama.cpp-${{ needs.check-release.outputs.release_tag }}-cuda-${CUDA_SHORT}-${ARCH}.tar.gz" \
+            "${ARCH}"
+
+          ls -lh release-assets/*.tar.gz
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: llama.cpp-cuda-${{ needs.setup-matrix.outputs.cuda_version_short }}-${{ matrix.arch }}
+          path: release-assets/*.tar.gz
+          retention-days: 1
+
+  release:
+    needs: [check-release, setup-matrix, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.check-release.outputs.release_tag }}
+          name: llama.cpp ${{ needs.check-release.outputs.release_tag }} with CUDA ${{ needs.setup-matrix.outputs.cuda_version_short }}
+          body: |
+            # llama.cpp ${{ needs.check-release.outputs.release_tag }} with CUDA Support
+
+            **Source:** https://github.com/ggml-org/llama.cpp/releases/tag/${{ needs.check-release.outputs.release_tag }}
+            **Commit:** ${{ needs.check-release.outputs.release_hash }}
+            **CUDA version:** ${{ needs.setup-matrix.outputs.cuda_version }}
+
+            For GPU Compute Capability reference: https://developer.nvidia.com/cuda/gpus
+          files: release-assets/*
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: true
